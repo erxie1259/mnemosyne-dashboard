@@ -1,5 +1,22 @@
 # Changelog
 
+## 0.14.1
+
+### Fixes
+
+- **Fix supersede_memory embedding**: Replacement memory now gets vector embedding for vector recall (defect 1).
+- **Fix supersede_memory consolidation**: Replacement memory now gets `consolidated_at` set to exempt from 24h trim (defect 2).
+- **Fix backup_database WAL safety**: Backup now performs `PRAGMA wal_checkpoint(TRUNCATE)` before copying to ensure unflushed WAL pages are included (defect 3).
+- **Fix /api/health**: Now actually probes the database (checks readable, expected tables present, row-count sanity) and returns 503 on failure instead of hardcoded 200 (defect 4).
+
+### Tests
+
+- Add test for supersede creating embedding and setting consolidated_at.
+- Add test for WAL-safe backup operation.
+- Add test for health endpoint probing database.
+- Add test for health endpoint failing on missing DB.
+- Add test for health endpoint failing on empty database.
+
 ## 0.14.0
 
 - Restore `?tab=history` compatibility by aliasing old history deep links to the current Activity view.

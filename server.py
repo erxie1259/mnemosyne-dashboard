@@ -322,7 +322,45 @@ class Handler(BaseHTTPRequestHandler):
             if path == "/api/auth/status":
                 return self._send_json(self._auth_status())
             if path == "/api/health":
-                return self._send_json({"ok": True, "service": "mnemosyne-dashboard", "read_only": not self.cfg.memory_admin_enabled, "config": public_config(self.cfg)})
+                # Actually probe the DB: check readable, expected tables present, row-count sanity
+                try:
+                    diagnostics = self.store.diagnostics()
+                    if not diagnostics.get("ok", False):
+                        return self._send_json({
+                            "ok": False,
+                            "service": "mnemosyne-dashboard",
+                            "read_only": not self.cfg.memory_admin_enabled,
+                            "error": diagnostics.get("error", "DB probe failed"),
+                            "missing_expected_tables": diagnostics.get("missing_expected_tables", []),
+                            "config": public_config(self.cfg)
+                        }, 503)
+                    # Row count sanity check: working_memory should have reasonable count
+                    working_count = diagnostics.get("table_counts", {}).get("working_memory", 0)
+                    episodic_count = diagnostics.get("table_counts", {}).get("episodic_memory", 0)
+                    if working_count > 100000 or episodic_count > 100000:
+                        return self._send_json({
+                            "ok": False,
+                            "service": "mnemosyne-dashboard",
+                            "read_only": not self.cfg.memory_admin_enabled,
+                            "error": f"Unexpectedly large row counts: working={working_count}, episodic={episodic_count}",
+                            "config": public_config(self.cfg)
+                        }, 503)
+                    return self._send_json({
+                        "ok": True,
+                        "service": "mnemosyne-dashboard",
+                        "read_only": not self.cfg.memory_admin_enabled,
+                        "working_memory_count": working_count,
+                        "episodic_memory_count": episodic_count,
+                        "config": public_config(self.cfg)
+                    })
+                except Exception as exc:
+                    return self._send_json({
+                        "ok": False,
+                        "service": "mnemosyne-dashboard",
+                        "read_only": not self.cfg.memory_admin_enabled,
+                        "error": str(exc),
+                        "config": public_config(self.cfg)
+                    }, 503)
             if path == "/api/config":
                 return self._send_json({"ok": True, "config": public_config(self.cfg)})
             if path == "/api/diagnostics":

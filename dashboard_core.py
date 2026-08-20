@@ -17,6 +17,12 @@ try:
 except Exception:  # pragma: no cover - dashboard degrades when package is unavailable
     PatternDetector = None
 
+# Import mnemosyne embeddings module for vector recall support
+try:
+    from mnemosyne.core import embeddings as _embeddings
+except Exception:  # pragma: no cover - embeddings optional
+    _embeddings = None
+
 
 def plugin_data_dir() -> Path:
     home = Path(os.environ.get("HERMES_HOME", str(Path.home() / ".hermes")))
@@ -914,6 +920,9 @@ class DashboardStore:
         backup_dir.mkdir(parents=True, exist_ok=True)
         stamp = _utc_now().replace(":", "").replace("-", "")
         target = backup_dir / f"mnemosyne-{stamp}-{uuid.uuid4().hex[:8]}.db"
+        # WAL-safe backup: checkpoint first to flush -wal to main DB, then copy
+        with self.connect_rw() as con:
+            con.execute("PRAGMA wal_checkpoint(TRUNCATE)")
         shutil.copy2(self.db_path, target)
         return {"path": str(target), "size_bytes": target.stat().st_size, "created_at": _utc_now()}
 
@@ -1035,6 +1044,8 @@ class DashboardStore:
         metadata = dict(before.get("metadata") or {})
         metadata.update({"supersedes": memory_id, "created_by": "mnemosyne-dashboard"})
         backup_info = self.backup_database() if backup else None
+        # Pin the replacement with consolidated_at to exempt from 24h trim
+        consolidated_at = now
         with self.connect_rw() as con:
             tables = self._tables(con)
             if "working_memory" not in tables:
@@ -1042,8 +1053,8 @@ class DashboardStore:
             con.execute("""
                 INSERT INTO working_memory(
                     id, content, source, timestamp, session_id, importance, metadata_json,
-                    created_at, valid_until, superseded_by, scope, author_id, author_type, channel_id
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, ?, ?, ?, ?)
+                    created_at, valid_until, superseded_by, scope, author_id, author_type, channel_id, consolidated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, ?, ?, ?, ?, ?)
             """, (
                 replacement_id,
                 content,
@@ -1057,6 +1068,7 @@ class DashboardStore:
                 before.get("author_id"),
                 before.get("author_type"),
                 before.get("channel_id"),
+                consolidated_at,
             ))
             for table in ("working_memory", "episodic_memory"):
                 if table in tables:
@@ -1064,8 +1076,8 @@ class DashboardStore:
             if "memories" in tables:
                 cols = {r[1] for r in con.execute("PRAGMA table_info(memories)")}
                 if {"id", "content"} <= cols:
-                    keys = ["id", "content"]
-                    values = [replacement_id, content]
+                    keys = ["id", "content", "consolidated_at"]
+                    values = [replacement_id, content, consolidated_at]
                     optional = {
                         "source": before.get("source"),
                         "timestamp": now,
@@ -1078,7 +1090,7 @@ class DashboardStore:
                             keys.append(k)
                             values.append(v)
                     con.execute(f"INSERT OR REPLACE INTO memories ({', '.join(keys)}) VALUES ({', '.join(['?'] * len(keys))})", values)
-                    if "superseded_by" in cols or "valid_until" in cols:
+                    if {"valid_until", "superseded_by"} & cols:
                         sets = []
                         vals = []
                         if "valid_until" in cols:
@@ -1090,9 +1102,23 @@ class DashboardStore:
                         vals.append(memory_id)
                         con.execute(f"UPDATE memories SET {', '.join(sets)} WHERE id = ?", vals)
             con.commit()
+            # Create vector embedding for the replacement row to enable vector recall
+            if _embeddings is not None and _embeddings.available():
+                try:
+                    vec = _embeddings.embed([content])
+                    if vec is not None and len(vec) > 0:
+                        model = _embeddings._DEFAULT_MODEL
+                        emb_json = _embeddings.serialize(vec[0])
+                        con.execute(
+                            "INSERT OR REPLACE INTO memory_embeddings (memory_id, embedding_json, model) VALUES (?, ?, ?)",
+                            (replacement_id, emb_json, model)
+                        )
+                        con.commit()
+                except Exception:
+                    pass  # Embedding failure is non-fatal; memory remains keyword-findable
         replacement = self.get_memory(replacement_id)
         after = self.get_memory(memory_id)
-        self._audit("supersede", memory_id, before, after, {"replacement_id": replacement_id, "backup": backup_info})
+        self._audit("supersede", memory_id, before, after, {"replacement_id": replacement_id, "backup": backup_info, "consolidated_at": consolidated_at})
         return {"ok": True, "memory_id": memory_id, "replacement_id": replacement_id, "backup": backup_info, "item": after, "replacement": replacement}
 
 
