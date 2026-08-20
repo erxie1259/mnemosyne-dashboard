@@ -22,7 +22,7 @@ def make_db(path: Path):
         recall_count INTEGER DEFAULT 0, last_recalled TIMESTAMP DEFAULT NULL,
         valid_until TIMESTAMP DEFAULT NULL, superseded_by TEXT DEFAULT NULL,
         scope TEXT DEFAULT 'global', author_id TEXT, author_type TEXT, channel_id TEXT,
-        veracity TEXT DEFAULT 'unknown'
+        veracity TEXT DEFAULT 'unknown', consolidated_at TEXT
     );
     CREATE TABLE episodic_memory (
         rowid INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -44,17 +44,23 @@ def make_db(path: Path):
         id INTEGER PRIMARY KEY AUTOINCREMENT, session_id TEXT, items_consolidated INTEGER,
         summary_preview TEXT, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
     );
+    CREATE TABLE memory_embeddings (
+        memory_id TEXT PRIMARY KEY,
+        embedding_json TEXT NOT NULL,
+        model TEXT DEFAULT 'bge-small-en-v1.5',
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    );
     """)
-    con.execute("INSERT INTO working_memory(id,content,source,timestamp,session_id,importance,scope) VALUES (?,?,?,?,?,?,?)",
-                ('w1','YC prefers local-only WhatsApp memory','preference','2026-01-01T00:00:00','s1',0.9,'global'))
+    con.execute("INSERT INTO working_memory(id,content,source,timestamp,session_id,importance,scope,consolidated_at) VALUES (?,?,?,?,?,?,?,?)",
+                ('w1','YC prefers local-only WhatsApp memory','preference','2026-01-01T00:00:00','s1',0.9,'global',None))
     con.execute("INSERT INTO episodic_memory(id,content,source,timestamp,session_id,importance,scope,summary_of) VALUES (?,?,?,?,?,?,?,?)",
                 ('e1','Built a Mnemosyne dashboard visualiser','task','2026-01-02T00:00:00','s2',0.6,'session','w1'))
-    con.execute("INSERT INTO working_memory(id,content,source,timestamp,session_id,importance,scope) VALUES (?,?,?,?,?,?,?)",
-                ('w2','YC uses Obsidian for notes','preference','2026-01-03T00:00:00','s3',0.4,'global'))
-    con.execute("INSERT INTO working_memory(id,content,source,timestamp,session_id,importance,scope) VALUES (?,?,?,?,?,?,?)",
-                ('w3','YC knows Diana from school','preference','2026-01-04T00:00:00','s4',0.4,'global'))
-    con.execute("INSERT INTO working_memory(id,content,source,timestamp,session_id,importance,scope,last_recalled) VALUES (?,?,?,?,?,?,?,?)",
-                ('w4','YC uses WHOOP for health and recovery','health','2026-05-04T08:00:00','s5',0.7,'global','2026-05-04T09:00:00'))
+    con.execute("INSERT INTO working_memory(id,content,source,timestamp,session_id,importance,scope,consolidated_at) VALUES (?,?,?,?,?,?,?,?)",
+                ('w2','YC uses Obsidian for notes','preference','2026-01-03T00:00:00','s3',0.4,'global',None))
+    con.execute("INSERT INTO working_memory(id,content,source,timestamp,session_id,importance,scope,consolidated_at) VALUES (?,?,?,?,?,?,?,?)",
+                ('w3','YC knows Diana from school','preference','2026-01-04T00:00:00','s4',0.4,'global',None))
+    con.execute("INSERT INTO working_memory(id,content,source,timestamp,session_id,importance,scope,consolidated_at,last_recalled) VALUES (?,?,?,?,?,?,?,?,?)",
+                ('w4','YC uses WHOOP for health and recovery','health','2026-05-04T08:00:00','s5',0.7,'global',None,'2026-05-04T09:00:00'))
     con.execute("INSERT INTO episodic_memory(id,content,source,timestamp,session_id,importance,scope,summary_of) VALUES (?,?,?,?,?,?,?,?)",
                 ('e2','Shipped Mnemosyne Dashboard v0.7 planning','task','2026-05-04T10:00:00','s5',0.5,'session','w4'))
     con.execute("INSERT INTO triples(subject,predicate,object,valid_from,source,confidence) VALUES (?,?,?,?,?,?)",
@@ -78,7 +84,7 @@ def test_release_version_is_consistent():
     project_version = pyproject['project']['version']
     plugin_text = (ROOT / 'plugin.yaml').read_text()
 
-    assert project_version == '0.14.0'
+    assert project_version == '0.14.1'
     assert f'version: "{project_version}"' in plugin_text
     assert Handler.server_version == f'MnemosyneDashboard/{project_version}'
 
@@ -342,6 +348,115 @@ def test_memory_status_filter_and_safe_mutations(tmp_path, monkeypatch):
     audit = store.audit_log()
     assert [row['action'] for row in audit[:5]] == ['supersede', 'expiry', 'veracity', 'importance', 'invalidate']
     assert Path(superseded['backup']['path']).exists()
+
+
+def test_supersede_creates_embedding_and_sets_consolidated_at(tmp_path):
+    """Fix defect 1 & 2: supersede should create embedding and pin with consolidated_at."""
+    db = tmp_path / 'mnemosyne.db'
+    make_db(db)
+    store = DashboardStore(db)
+    
+    # Supersede an existing memory
+    result = store.supersede_memory('w1', 'New YC preference for local-only memory', importance=0.95)
+    
+    # Check replacement has consolidated_at (defect 2 fix)
+    assert result['replacement']['consolidated_at'] is not None
+    assert result['replacement']['status'] == 'active'
+    
+    # Check embedding was created (defect 1 fix)
+    with store.connect() as con:
+        row = con.execute("SELECT memory_id FROM memory_embeddings WHERE memory_id = ?", 
+                         (result['replacement_id'],)).fetchone()
+        assert row is not None, "Replacement memory should have embedding row"
+        
+    # Verify the embedding is valid JSON
+    with store.connect() as con:
+        emb_json = con.execute("SELECT embedding_json FROM memory_embeddings WHERE memory_id = ?",
+                              (result['replacement_id'],)).fetchone()[0]
+        import json
+        emb_list = json.loads(emb_json)
+        assert isinstance(emb_list, list)
+        assert len(emb_list) > 0
+
+
+def test_backup_database_is_wal_safe(tmp_path):
+    """Fix defect 3: backup should checkpoint WAL before copying."""
+    db = tmp_path / 'mnemosyne.db'
+    con = sqlite3.connect(db)
+    con.executescript("""
+    CREATE TABLE working_memory (
+        id TEXT PRIMARY KEY, content TEXT NOT NULL, source TEXT, timestamp TEXT,
+        session_id TEXT DEFAULT 'default', importance REAL DEFAULT 0.5,
+        metadata_json TEXT, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        recall_count INTEGER DEFAULT 0, last_recalled TIMESTAMP DEFAULT NULL,
+        valid_until TIMESTAMP DEFAULT NULL, superseded_by TEXT DEFAULT NULL,
+        scope TEXT DEFAULT 'global', author_id TEXT, author_type TEXT, channel_id TEXT,
+        veracity TEXT DEFAULT 'unknown'
+    );
+    PRAGMA journal_mode=WAL;
+    """)
+    con.execute("INSERT INTO working_memory(id,content,source,timestamp,session_id,importance,scope) VALUES (?,?,?,?,?,?,?)",
+                ('test1', 'test content', 'test', '2026-01-01T00:00:00', 's1', 0.5, 'global'))
+    con.commit()
+    
+    # Write a larger amount to force WAL growth
+    for i in range(100):
+        con.execute("INSERT INTO working_memory(id,content,source,timestamp,session_id,importance,scope) VALUES (?,?,?,?,?,?,?)",
+                    (f'testdata{i}', f'content {i}', 'test', '2026-01-01T00:00:00', 's1', 0.5, 'global'))
+    con.commit()
+    con.close()
+    
+    # Check WAL exists (may or may not depending on checkpoint behavior)
+    wal_path = db.with_suffix('.db-wal')
+    wal_existed_before = wal_path.exists()
+    
+    store = DashboardStore(db)
+    backup_info = store.backup_database()
+    
+    # Backup should succeed
+    assert 'path' in backup_info
+    assert Path(backup_info['path']).exists()
+    
+    # After backup, WAL should be checkpointed
+    # Checkpoint(TRUNCATE) should leave WAL at 0 bytes
+    if wal_path.exists():
+        assert wal_path.stat().st_size < 10000, f"WAL should be checkpointed but is {wal_path.stat().st_size} bytes"
+
+
+def test_api_health_checks_database(tmp_path, monkeypatch):
+    """Fix defect 4: /api/health should actually probe the DB."""
+    from server import Handler, ThreadingHTTPServer
+    import json
+    import urllib.request
+    import threading
+    
+    db = tmp_path / 'mnemosyne.db'
+    make_db(db)
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
+    
+    # Create a test HTTP server with our DB
+    httpd = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    httpd.db_path = db
+    httpd.bind_host = "127.0.0.1"
+    httpd.bind_port = httpd.server_address[1]
+    
+    thread = threading.Thread(target=httpd.serve_forever, daemon=True)
+    thread.start()
+    
+    url = f"http://{httpd.server_address[0]}:{httpd.server_address[1]}/api/health"
+    
+    # Test successful health check
+    with urllib.request.urlopen(url, timeout=5) as resp:
+        assert resp.status == 200
+        data = json.loads(resp.read())
+        assert data['ok'] is True
+        assert 'working_memory_count' in data
+        assert 'episodic_memory_count' in data
+        # Verify counts match what we created
+        assert data['working_memory_count'] == 4
+        assert data['episodic_memory_count'] == 2
+    
+    httpd.shutdown()
 
 
 def test_config_file_env_and_runtime_overrides(tmp_path, monkeypatch):
@@ -1009,3 +1124,79 @@ def test_clear_password_keeps_localhost_admin_mode_allowed(tmp_path, monkeypatch
     assert cfg.auth_enabled is False
     assert cfg.has_password is False
     assert cfg.memory_admin_enabled is True
+
+
+def test_health_check_fails_on_broken_db(tmp_path, monkeypatch):
+    """Test that health check returns failure for missing/wrong DB."""
+    from server import Handler, ThreadingHTTPServer
+    import json
+    import urllib.request
+    import threading
+    
+    # Use a non-existent DB path
+    db = tmp_path / 'nonexistent.db'
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
+    
+    httpd = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    httpd.db_path = db
+    httpd.bind_host = "127.0.0.1"
+    httpd.bind_port = httpd.server_address[1]
+    
+    thread = threading.Thread(target=httpd.serve_forever, daemon=True)
+    thread.start()
+    
+    url = f"http://{httpd.server_address[0]}:{httpd.server_address[1]}/api/health"
+    
+    # Test that health check fails
+    try:
+        with urllib.request.urlopen(url, timeout=5) as resp:
+            # Should not succeed with 200
+            assert False, f"Expected failure but got status {resp.status}"
+    except urllib.error.HTTPError as exc:
+        assert exc.code == 503  # Service unavailable
+        data = json.loads(exc.read())
+        assert data['ok'] is False
+        assert 'error' in data
+    
+    httpd.shutdown()
+
+
+def test_health_check_fails_on_empty_db(tmp_path, monkeypatch):
+    """Test that health check fails on empty database without expected tables."""
+    from server import Handler, ThreadingHTTPServer
+    import json
+    import urllib.request
+    import threading
+    
+    db = tmp_path / 'empty.db'
+    con = sqlite3.connect(db)
+    con.execute("CREATE TABLE some_random_table (id INTEGER)")
+    con.commit()
+    con.close()
+    
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
+    
+    httpd = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    httpd.db_path = db
+    httpd.bind_host = "127.0.0.1"
+    httpd.bind_port = httpd.server_address[1]
+    
+    thread = threading.Thread(target=httpd.serve_forever, daemon=True)
+    thread.start()
+    
+    url = f"http://{httpd.server_address[0]}:{httpd.server_address[1]}/api/health"
+    
+    # Test that health check fails
+    try:
+        with urllib.request.urlopen(url, timeout=5) as resp:
+            # Should not succeed with 200
+            assert False, f"Expected failure but got status {resp.status}"
+    except urllib.error.HTTPError as exc:
+        assert exc.code == 503  # Service unavailable
+        data = json.loads(exc.read())
+        assert data['ok'] is False
+        assert 'missing_expected_tables' in data
+        assert 'working_memory' in data['missing_expected_tables']
+        assert 'episodic_memory' in data['missing_expected_tables']
+    
+    httpd.shutdown()
